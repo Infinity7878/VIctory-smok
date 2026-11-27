@@ -18,8 +18,7 @@ that revision.
 On Windows 11 with a Ryzen 7 9800X3D, Radeon RX 9070 XT 16 GB, and 32 GB RAM,
 the Series X profile reached the prison guard escort. Tested prison passages
 typically ran around 18–20 FPS, with shorter stretches at 23–26 FPS. Facial
-animation was observed, and tester feedback confirmed corrected eye shading
-and visible ground textures.
+animation was observed, and tester feedback confirmed corrected eye shading. Ground textures can show and then turn black again inside the prison.
 
 The intro still stutters. Blank phone screens and intermittent stretched
 polygons remain open. Sustained 60 FPS and later missions are unverified.
