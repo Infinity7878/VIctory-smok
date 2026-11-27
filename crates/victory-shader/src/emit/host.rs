@@ -1004,6 +1004,8 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
+    /// A typed R16_UINT buffer UAV of this many elements, zeroed.
+    Uint16Uav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
@@ -1240,7 +1242,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::Uint16Uav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1252,6 +1254,12 @@ impl Host {
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::Uint16Uav(e) => (
+                                e.div_ceil(2),
+                                DXGI_FORMAT_R16_UINT,
+                                e,
+                                D3D12_BUFFER_UAV_FLAG_NONE,
+                            ),
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;

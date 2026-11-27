@@ -1114,7 +1114,23 @@ fn own_bits_on() -> bool {
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
 pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+    // (`slot_counts` rides on the last word: off is a translation of its own.)
+    let counts_off = if slot_counts() { 0 } else { 1 << 31 };
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna() | counts_off,
+    ]
+}
+
+/// Whether a buffer's record count read as data comes from the host's table
+/// by heap slot ([`super::shader::SLOT_COUNTS_AT`]) rather than from a size
+/// query of the host view, which the AMD driver's compiler (RDNA 4) crashes
+/// on for raw buffers picked from the heap. `VICTORY_SLOT_COUNTS=0`: queried.
+pub(super) fn slot_counts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_COUNTS").is_none_or(|v| v != "0"))
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6517,19 +6533,32 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
+        // A buffer picked from the heap: its record count from the host's
+        // table, no size query ([`slot_counts`]).
+        let table_count = if image.is_none() {
+            self.slot_count(&src)?
         } else {
-            self.s.m.undef(i32t)
+            None
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+        let d = if table_count.is_none() {
+            let h = self.handle(site, &src, false, props)?;
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = if image.is_some() && !uav {
+                self.s.m.i32(0)
+            } else {
+                self.s.m.undef(i32t)
+            };
+            Some(
+                self.s
+                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]),
+            )
+        } else {
+            None
+        };
+        let c = self.cur;
+        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d.expect("a size query"), k);
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
@@ -6569,12 +6598,15 @@ impl<'a> Lower<'a> {
             }
             None => {
                 // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
                 let stride = used.map_or(0, |u| u.stride);
                 let counted = inst
                     .write(Reg::S(code + first + 2))
                     .is_some_and(|v| self.read_as_number(v));
-                let n = if props.0 & 0xFF == 11 && stride > 1 {
+                let n = if let Some(n) = table_count {
+                    // The console's own count already.
+                    n
+                } else if props.0 & 0xFF == 11 && stride > 1 {
+                    let n = field(self, 0);
                     let k = self.s.m.i32(stride);
                     self.s.m.bin(c, Bin::UDiv, n, k)
                 } else if props.0 & 0xFF == 11
@@ -6582,11 +6614,12 @@ impl<'a> Lower<'a> {
                     && let Some(stride) = self.slot_stride(&src)?
                 {
                     // Picked from the heap: the host's table has the stride.
+                    let n = field(self, 0);
                     let (i32t, one) = (self.s.t.i32, self.s.m.i32(1));
                     let k = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[stride, one]);
                     self.s.m.bin(c, Bin::UDiv, n, k)
                 } else {
-                    n
+                    field(self, 0)
                 };
                 let mut words = vec![(2, n)];
                 // Its address too, where the code computes with it and the
@@ -7474,7 +7507,7 @@ impl<'a> Lower<'a> {
     /// `ResourceHeap`): read from the host's table by heap slot in the
     /// current block.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let word = self.slot_word(src)?;
+        let word = self.slot_word(src, false)?;
         Ok(word.map(|word| {
             let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
             self.s.m.bin(self.cur, Bin::And, word, bits)
@@ -7482,10 +7515,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether the typed buffer view `src` names is one of an integer format,
-    /// and whether a signed one, as [`Self::slot_stride`] (`None`: a view the
-    /// program does not pick from the heap).
+    /// and whether a signed one. The host also records the format of views
+    /// in descriptor tables, including the animation network's R16_UINT views.
     fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
-        let Some(word) = self.slot_word(src)? else {
+        let Some(word) = self.slot_word(src, true)? else {
             return Ok(None);
         };
         let c = self.cur;
@@ -7500,7 +7533,7 @@ impl<'a> Lower<'a> {
 
     /// The host's word for the buffer view `src` names: its stride and
     /// format kind ([`super::shader::SLOT_STRIDES`]).
-    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
+    fn slot_word(&mut self, src: &Source, include_tables: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -7508,7 +7541,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(load)
             .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+            .is_some_and(|p| p.root == RootType::ResourceHeap || include_tables && p.root == RootType::Table);
         if !heap {
             return Ok(None);
         }
@@ -7542,6 +7575,54 @@ impl<'a> Lower<'a> {
         let v = self.as_int(f);
         self.strides.insert(key, v);
         Ok(Some(v))
+    }
+
+    /// The record count of the buffer view `src` names, from the host's
+    /// table ([`super::shader::SLOT_COUNTS_AT`]); `None` for a view outside
+    /// the view heap (a root view), or with `VICTORY_SLOT_COUNTS=0`. A
+    /// descriptor table is a place in the heap, so its views have slots too.
+    fn slot_count(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        if !slot_counts() {
+            return Ok(None);
+        }
+        let Source::Loaded { load, first } = src else {
+            return Ok(None);
+        };
+        let heap = self
+            .scalar
+            .get(load)
+            .and_then(|a| self.x.native.layout.get(a.param))
+            .is_some_and(|p| matches!(p.root, RootType::ResourceHeap | RootType::Table));
+        if !heap {
+            return Ok(None);
+        }
+        let c = self.cur;
+        let slot = self.heap_index(*load, *first, false)?;
+        // Inside the table whatever the index, as `slot_word`'s.
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let at = self.s.m.i32(super::shader::SLOT_COUNTS_AT);
+        let dword = self.s.m.bin(c, Bin::Add, slot, at);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, dword, two);
+        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        Ok(Some(self.as_int(f)))
     }
 
     /// The heap index of a descriptor that may differ between lanes,

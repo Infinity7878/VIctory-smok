@@ -178,6 +178,8 @@ fn sizes_of_a_volume_or_an_array_stay_untranslated() {
 /// it tests the record count of a view it never reads.
 #[test]
 fn the_record_count_of_a_structured_buffer_nothing_reads() {
+    // The console's view counts three elements of 16 bytes.
+    super::waterfall_tests::TITLE_COUNTS.with(|c| *c.borrow_mut() = vec![3]);
     let words = [TABLE, COUNT, STORE].concat();
     let shader = build(&words, (4, 16)).expect("translates");
     let (data, texel) = ([0u32; 12], [[0.0; 4]; 1]);
@@ -202,6 +204,7 @@ fn the_record_count_of_a_structured_buffer_nothing_reads() {
 /// program also reads by index.
 #[test]
 fn the_record_count_of_a_structured_buffer_read_by_index() {
+    super::waterfall_tests::TITLE_COUNTS.with(|c| *c.borrow_mut() = vec![3]);
     let load = [
         0x7E06_0280, // v_mov_b32 v3, 0
         0xE030_2000, // buffer_load_dword v5, v3, s[8:11], 0 idxen
@@ -367,5 +370,51 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
+    }
+}
+
+#[test]
+fn d16_loads_preserve_integer_bits_from_a_descriptor_table() {
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT};
+
+    let load = [
+        0xF408_0201u32, // s_load_dwordx4 s[8:11], s[2:3], 0
+        0xFA00_0000,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0xE200_2000, // buffer_load_format_d16_x v5, v0, s[8:11], 0 idxen
+        0x8002_0500,
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+        0xBE84_0380, // s_mov_b32 s4, 0
+    ];
+    let shader = build(&[TABLE, &load, STORE].concat(), (4, 2)).expect("translates");
+    assert!(shader.root_srvs.contains(&super::SLOT_STRIDES));
+    for (format, bits) in [(DXGI_FORMAT_R16_UINT, 0x6a31), (DXGI_FORMAT_R16_FLOAT, 0x3c00)] {
+        let data = [bits];
+        let view = View::Buffer { data: &data, stride: Stride::Format(format, 2) };
+        let unused = View::Buffer { data: &[0], stride: Stride::Raw };
+        let views = [view, unused, View::RawUav(2)];
+        for (label, got) in run(&shader, &views) {
+            assert_eq!(got[..2], [0, bits], "{label}: {format:?}");
+        }
+    }
+}
+
+#[test]
+fn d16_stores_preserve_integer_bits_in_a_descriptor_table() {
+    let store = [
+        0x7E00_0280u32, // v_mov_b32 v0, 0
+        0x7E08_02FF, // v_mov_b32 v4, 0xaa986a31
+        0xAA98_6A31,
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xE21C_2000, // buffer_store_format_d16_xyzw v[4:5], v0, s[20:23], 0 idxen
+        0x8005_0400,
+        0xBF81_0000, // s_endpgm
+    ];
+    let shader = build(&[TABLE, &store].concat(), (4, 2)).expect("translates");
+    assert!(shader.root_srvs.contains(&super::SLOT_STRIDES));
+    let unused = View::Buffer { data: &[0], stride: Stride::Raw };
+    let views = [View::Cbv(&[0]), unused, View::Uint16Uav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[0] & 0xffff, 0x6a31, "{label}");
     }
 }
