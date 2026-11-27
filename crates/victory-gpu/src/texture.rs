@@ -1475,21 +1475,37 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// (a texture streams in whole mips; the small ones lie first). Read
 /// through the kernel, so pages not there count as zeros.
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    fingerprint_for(at, len, false)
+}
+
+/// Read all of a small texture that the title updates in place. Its video
+/// planes can change between the windows the sparse fingerprint samples.
+pub(crate) const LIVE_TEXTURE_MAX_BYTES: u64 = 4 << 20;
+
+pub(crate) fn fingerprint_for(at: u64, len: u64, live: bool) -> u64 {
     const WINDOW: usize = 16 << 10;
+    const CHUNK: usize = 64 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let whole = live && len <= LIVE_TEXTURE_MAX_BYTES;
     let len = len as usize;
     let mut print = 0u128;
     READ.with(|read| {
         let mut read = read.borrow_mut();
-        read.resize(3 * WINDOW, 0);
+        read.resize(if whole { CHUNK } else { 3 * WINDOW }, 0);
         let mut take = |from: usize, bytes: usize| {
             read[..bytes].fill(0);
-            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            if let Some(address) = (at as usize).checked_add(from) {
+                crate::host::copy_mapped(read.as_mut_ptr(), address as *const u8, bytes, false);
+            }
             print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
         };
-        if len <= 3 * WINDOW {
+        if whole {
+            for from in (0..len).step_by(CHUNK) {
+                take(from, CHUNK.min(len - from));
+            }
+        } else if len <= 3 * WINDOW {
             take(0, len);
         } else {
             take(0, WINDOW);

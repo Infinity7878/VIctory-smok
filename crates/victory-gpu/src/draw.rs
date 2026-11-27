@@ -619,6 +619,14 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Consecutive unchanged video texture checks before backing off.
+const LIVE_TEXTURE_IDLE_FRAMES: u8 = 120;
+
+fn live_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIVE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2266,18 +2274,29 @@ impl State {
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
-            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+            let mut live = false;
+            if let Some((at, len, print, looks, uploaded, was_live)) = host.texture_slot_checked(index) {
+                if crate::texture::fingerprint_for(at, len, was_live) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    if was_live {
+                        if looks + 1 < LIVE_TEXTURE_IDLE_FRAMES {
+                            host.texture_slot_recheck(index, write, frame + 1, (at, len), print, looks + 1, uploaded, true);
+                        } else {
+                            let print = crate::texture::fingerprint(at, len);
+                            host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[1], (at, len), print, 1, uploaded, false);
+                        }
+                        continue;
+                    }
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded, false)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
                 }
-                if recheck_soon() {
+                live = live_textures() && len <= crate::texture::LIVE_TEXTURE_MAX_BYTES;
+                if live || recheck_soon() {
                     again_in = 1;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
@@ -2297,6 +2316,7 @@ impl State {
                         bytes = len,
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
+                        live,
                         changed = n + 1,
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
@@ -2445,8 +2465,9 @@ impl State {
                 let memory = if again.is_none() && heap_recheck() { crate::texture::title_span(resource, first) } else { None };
                 match memory {
                     Some((at, len)) => {
-                        let print = crate::texture::fingerprint(at, len);
-                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                        let live = live && len <= crate::texture::LIVE_TEXTURE_MAX_BYTES;
+                        let print = crate::texture::fingerprint_for(at, len, live);
+                        host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                     }
                     None => host.texture_slot_done(index, write, again),
                 }
@@ -2556,8 +2577,9 @@ impl State {
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
-                    let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
+                    let live = live && len <= crate::texture::LIVE_TEXTURE_MAX_BYTES;
+                    let print = crate::texture::fingerprint_for(at, len, live);
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame, live);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2609,6 +2631,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::trace_compute(self.pipeline as This, "disabled by filter", || {});
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return;
@@ -2618,6 +2641,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
+                crate::pipeline::trace_compute(self.pipeline as This, "builder disabled", || {});
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
@@ -2631,6 +2655,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
+                crate::pipeline::trace_compute(self.pipeline as This, "no host pipeline", || {});
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
@@ -2641,6 +2666,8 @@ impl State {
             return;
         }
         if !self.bind(list, p, true) {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::trace_compute(self.pipeline as This, "root binding failed", || {});
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2675,9 +2702,20 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::trace_compute(self.pipeline as This, "direct recorded", || {
+            self.trace_compute_views(p, [x, y, z], flags)
+        });
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.after_dispatch(list, p, false);
+    }
+
+    fn after_dispatch(&mut self, list: &HostList, p: &HostPipeline, indirect: bool) {
+        use crate::ambient::{Role, reflection_limit};
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && (!indirect || role == Role::Reflect)
+            && (role != Role::Reflect || reflection_limit() > 0.0)
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
@@ -2686,10 +2724,54 @@ impl State {
         }
     }
 
+    /// Log the descriptor-table slots passed to a selected compute shader.
+    #[cfg(feature = "diagnostics")]
+    fn trace_compute_views(&self, p: &HostPipeline, groups: [u32; 3], flags: u32) {
+        let title_heap = self.heaps.first().copied().filter(|&heap| heap != 0)
+            .map(|heap| crate::descriptor::heap(heap as This));
+        let heap = title_heap.and_then(|heap| heap.host());
+        let Some(stage) = p.stages.first() else {
+            return;
+        };
+        let translated = stage.translated();
+        let mut slots = Vec::new();
+        let mut temporary = Vec::new();
+        for used in translated.used.iter().filter(|used| used.root == RootType::Table) {
+            let index = translated.host.user_data.iter()
+                .find(|data| data.root == RootType::Table && data.slot == used.slot)
+                .and_then(|data| self.user.get(data.index as usize))
+                .map(|base| base.wrapping_add(used.table_offset_dwords * 4) / 32);
+            let view = index.and_then(|index| heap.and_then(|heap| heap.describe_slot(index)));
+            slots.push((used.kind, used.slot, used.table_offset_dwords, index, view));
+            if let (Some(title_heap), Some(heap), Some(index)) = (title_heap, heap, index)
+                && self.dynamic.iter().any(|&(owner, first, count)| {
+                    owner == std::ptr::from_ref(title_heap) as usize && index.wrapping_sub(first) < count
+                })
+            {
+                // SAFETY: this recording list holds the slot.
+                if let Some((word, records)) = unsafe { heap.dynamic_buffer_metadata(index) } {
+                    temporary.push((used.kind, used.slot, used.table_offset_dwords, format!("{word:#010x}"), records));
+                }
+            }
+        }
+        tracing::info!(
+            hash = %stage.shader.hash,
+            frame = crate::frame::current(),
+            ?groups,
+            flags,
+            threads = ?translated.threads,
+            stores = translated.stores,
+            host_tables = ?slots,
+            temporary_metadata = ?temporary,
+            stride_table = translated.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES),
+            "selected compute bindings"
+        );
+    }
+
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2717,22 +2799,29 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
+        let image = match role {
+            Role::Resolve => entry(ResourceType::Uav, LIGHT),
+            Role::Radiance => entry(ResourceType::Uav, RADIANCE),
+            Role::Air => entry(ResourceType::Uav, AIR),
+            Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
+                entry(ResourceType::Uav, at).filter(|(desc, _)| {
+                    desc.Format.0 == 42 && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                })
+            }),
         };
-        let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = match role {
+            Role::Resolve | Role::Reflect => 42,
+            Role::Radiance | Role::Air => 26,
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -3911,6 +4000,8 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::trace_compute(self.pipeline as This, "indirect recorded", || {});
             self.buffers_written();
         } else {
             self.drew(Some(p));
@@ -3920,6 +4011,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.after_dispatch(list, p, true);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

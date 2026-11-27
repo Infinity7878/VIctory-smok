@@ -445,6 +445,38 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+/// Log the first result of each kind for selected compute shaders. Accepts
+/// comma-separated 16-character shader hashes from the first-bind log.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_compute(this: This, result: &'static str, details: impl Fn()) {
+    use std::collections::HashSet;
+    static FILTER: OnceLock<HashSet<String>> = OnceLock::new();
+    static SEEN: Mutex<Option<HashSet<(String, &'static str)>>> = Mutex::new(None);
+    let filter = FILTER.get_or_init(|| {
+        std::env::var("VICTORY_TRACE_COMPUTE")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase)
+            .collect()
+    });
+    if filter.is_empty() || this.is_null() {
+        return;
+    }
+    for shader in &pipeline(this).shaders {
+        if shader.stage != "compute" || !filter.contains(&shader.hash) {
+            continue;
+        }
+        let first = SEEN.lock().unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashSet::new).insert((shader.hash.clone(), result));
+        if first {
+            tracing::info!(hash = %shader.hash, frame = crate::frame::current(), result, "selected compute dispatch");
+            details();
+        }
+    }
+}
+
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).
