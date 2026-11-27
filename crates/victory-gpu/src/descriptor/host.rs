@@ -891,6 +891,8 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// Keep checking a texture whose bytes the title rewrites in place.
+    live: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -917,7 +919,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), live: false });
     }
 
     fn remove(&mut self, index: u32) {
@@ -1024,17 +1026,20 @@ impl TextureQueue {
     /// title that fills a texture's memory after it wrote the view (the
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
-    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64, live: bool) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
+            w.live = live;
         }
     }
 
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
-    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
+        let w = self.slots.get(&index)?;
+        let (at, len, print, looks, uploaded) = w.checked;
+        (print != 0).then_some((at, len, print, looks, uploaded, w.live))
     }
 
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
@@ -1045,7 +1050,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), live: false });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1125,6 +1130,45 @@ fn view_kind(view: &View) -> u32 {
         Some((0, false, 3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62)) => VIEW_INTEGER,
         Some((0, false, 4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64)) => VIEW_INTEGER | VIEW_SIGNED,
         _ => 0,
+    }
+}
+
+/// A buffer view's record count as the console's descriptor holds it, for
+/// shaders that read it (`victory_shader::emit::SLOT_COUNTS_AT`): its
+/// elements, of a raw view its bytes (a raw view's elements are dwords);
+/// 0 for any other view.
+fn view_records(view: &View) -> u32 {
+    let Some((_, raw, _)) = view_elements(view) else {
+        return 0;
+    };
+    let elements = view_words(view).map_or(0, |(words, unordered)| {
+        // SAFETY: buffer views' union members.
+        unsafe {
+            if unordered {
+                uav_desc(words).Anonymous.Buffer.NumElements
+            } else {
+                srv_desc(words).Anonymous.Buffer.NumElements
+            }
+        }
+    });
+    if raw {
+        elements.saturating_mul(4)
+    } else {
+        elements
+    }
+}
+
+/// The title's description of the buffer view `view` and whether it is an
+/// unordered one; `None` if `view` is not a buffer view.
+fn view_words(view: &View) -> Option<(&[u32; 10], bool)> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => Some((d, false)),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => Some((d, true)),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+            Some((d[..10].try_into().ok()?, *unordered))
+        }
+        _ => None,
     }
 }
 
@@ -1512,7 +1556,10 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                // The strides, then the record counts (`SLOT_COUNTS_AT`).
+                let bytes = u64::from(
+                    victory_shader::emit::SLOT_COUNTS_AT + victory_shader::emit::SLOT_STRIDES_COUNT,
+                ) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1776,13 +1823,14 @@ impl HostHeap {
         print: u64,
         looks: u8,
         uploaded: u64,
+        live: bool,
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, write, due, at, print, looks, uploaded);
+        textures.recheck(index, write, due, at, print, looks, uploaded, live);
     }
 
     /// See [`TextureQueue::checked`].
-    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64, bool)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
@@ -2503,14 +2551,7 @@ impl HostHeap {
             }
         }
         let stride = view.and_then(view_stride);
-        let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
-        }
+        self.write_buffer_metadata(index, stride, view);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -2541,6 +2582,49 @@ impl HostHeap {
         }
     }
 
+    /// Write both shader-visible metadata words for a buffer descriptor.
+    fn write_buffer_metadata(&self, index: u32, stride: Option<u32>, view: Option<&View>) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let kind = view.map_or(0, view_kind);
+            let records = view.map_or(0, view_records);
+            // SAFETY: both tables cover this slot. Writes follow the
+            // caller's descriptor publication and use aligned dwords.
+            unsafe {
+                let slot = (*data as *mut u32).add(index as usize);
+                slot.write_volatile(stride.unwrap_or(0) | kind);
+                slot.add(victory_shader::emit::SLOT_COUNTS_AT as usize).write_volatile(records);
+            }
+        }
+    }
+
+    /// Update a temporary slot owned by the recording list. A reused null
+    /// or constant descriptor must clear metadata from its previous view.
+    fn set_dynamic_buffer_metadata(&self, index: u32, view: Option<&View>) {
+        if index >= self.count {
+            self.write_buffer_metadata(index, view.and_then(view_stride), view);
+        }
+    }
+
+    /// Stride/format and record count for a slot owned by the caller.
+    ///
+    /// # Safety
+    /// The caller owns the slot while reading it.
+    #[cfg(any(test, feature = "diagnostics"))]
+    pub(crate) unsafe fn dynamic_buffer_metadata(&self, index: u32) -> Option<(u32, u32)> {
+        let (_, _, data) = self.strides.as_ref()?;
+        if !(self.count..victory_shader::emit::SLOT_STRIDES_COUNT).contains(&index) {
+            return None;
+        }
+        // SAFETY: the mapping covers the slot. The caller's list still owns
+        // the slot, so it cannot be recycled while this thread observes it.
+        unsafe {
+            let slot = (*data as *const u32).add(index as usize);
+            Some((slot.read_volatile(), slot.add(victory_shader::emit::SLOT_COUNTS_AT as usize).read_volatile()))
+        }
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -2549,6 +2633,7 @@ impl HostHeap {
             null_for(view, self.at(index));
         }
         self.put(index);
+        self.set_dynamic_buffer_metadata(index, kept.is_some().then_some(view));
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
     }
@@ -2592,6 +2677,7 @@ impl HostHeap {
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
+            self.set_dynamic_buffer_metadata(index, Some(&made.view));
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2622,6 +2708,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.set_dynamic_buffer_metadata(index, None);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -2815,6 +2902,7 @@ impl HostHeap {
                 .CreateConstantBufferView(Some(&desc), self.at(index))
         };
         self.put(index);
+        self.set_dynamic_buffer_metadata(index, None);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some(twin) = twin {
@@ -4769,6 +4857,23 @@ mod tests {
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
     }
 
+    #[test]
+    fn temporary_buffer_views_publish_and_clear_record_counts() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let index = heap.dynamic(1).expect("one temporary slot");
+        let view = View::Unordered(0, 0, Some([57, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        // SAFETY: this test owns the temporary slot throughout.
+        let metadata = || unsafe { heap.dynamic_buffer_metadata(index) };
+        heap.set_dynamic_buffer_metadata(index, Some(&view));
+        assert_eq!(metadata(), Some((victory_shader::emit::VIEW_INTEGER | 2, 64)));
+        heap.make_null(index);
+        assert_eq!(metadata(), Some((0, 0)));
+        heap.release(index, 1);
+    }
+
     /// What may stand for a texture that is not there yet: one of its kind in
     /// another place or size; another one only if asked; nothing a shader
     /// cannot read in its place.
@@ -5086,6 +5191,24 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn live_texture_rechecks_follow_the_current_write() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 1, false);
+        let write = q.due(1, 1)[0].1;
+        q.recheck(7, write, 2, (0x1000, 0x2000), 5, 0, 1, true);
+        assert_eq!(q.checked(7), Some((0x1000, 0x2000, 5, 0, 1, true)));
+        assert!(q.due(1, 1).is_empty());
+        assert_eq!(q.due(2, 1), [(7, write)]);
+        q.recheck(7, write, 14, (0x1000, 0x2000), 6, 1, 1, false);
+        assert_eq!(q.checked(7).map(|c| c.5), Some(false));
+
+        q.written(7, 3, 3, false);
+        q.recheck(7, write, 4, (0x1000, 0x2000), 5, 0, 3, true);
+        assert_eq!(q.checked(7), None);
+        assert_ne!(q.due(3, 1)[0].1, write);
     }
 
     /// Slots held back for lack of room on the card are not handed out
