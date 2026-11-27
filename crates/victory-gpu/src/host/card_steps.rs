@@ -158,6 +158,14 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         });
                     }
                 }
+                // The texels arrive in title memory when the flight lands.
+                // A buffer's host copy of the same range can still be stale.
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -933,6 +941,28 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_copy_back_writers_refuse_overlapping_reads() {
+        let flight = Flight {
+            number: 1,
+            fence: 1,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: Vec::new(),
+            own: None,
+            texture_back_ranges: vec![(100, 108)],
+        };
+        let writers = writers(&[Late::Run(flight)]);
+        let pending = "a read-back or a value behind a flight is written there";
+        for (from, to) in [(96, 101), (100, 108), (104, 120)] {
+            assert_eq!(holder(&writers, from, to).err(), Some(pending));
+        }
+        for (from, to) in [(90, 100), (108, 120)] {
+            assert_ne!(holder(&writers, from, to).err(), Some(pending));
+        }
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
