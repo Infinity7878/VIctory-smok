@@ -1,117 +1,68 @@
-# VIctory on an RX 7900 XTX
+# VIctory-smok for Windows
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+VIctory-smok is a Windows build of the VIctory compatibility layer with fixes
+tested on AMD RDNA 4. The `windows-rdna4` branch builds from upstream revision
+`e2a28ec`, the base used for the test results below.
+[Upstream project](https://github.com/avatarmanz/VIctory-7900XTX)
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+## Test status
 
-## Where it stands (2026-11-25)
+The test PC had Windows 11, a Ryzen 7 9800X3D, Radeon RX 9070 XT 16 GB, and 32 GB
+RAM. Tests used the Series X profile, ray tracing off, and a warmed pipeline
+cache. Results are from the prologue and prison.
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+| Area | Observed result |
+| --- | --- |
+| Progression | Reached the guard escort through the prison hallway. Later missions are unverified. |
+| Frame rate | Usually 18–20 FPS during the tested prison sequences, with short stretches at 23–26 FPS. The intro still has stalls. |
+| Characters | Lip, jaw, and blink animation observed. The tester confirmed corrected eye shading. |
+| Ground and geometry | The tester confirmed visible ground textures. Intermittent stretched polygons remain open. |
+| Phone displays | Blank screens remain open. The experimental texture refresh ran on intro video textures. |
+| 60 FPS | Still a target. The tested title requested a 33.3 ms frame interval. |
 
-| | |
-|---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+## Build and run
 
-It started at 280 ms a frame in the same scenes two days earlier.
+Use Windows 10 or 11 x64, an AVX2-capable CPU, a Direct3D 12 GPU with shader
+model 6.6 and mesh shader support, the pinned Rust toolchain, and the Visual
+Studio C++ build tools. Supply your own compatible title files and store
+them outside this checkout.
 
-What is known to be wrong:
-
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+From a Visual Studio Developer PowerShell:
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+git clone --branch windows-rdna4 https://github.com/Infinity7878/VIctory-smok.git
+Set-Location VIctory-smok
+Copy-Item victory.example.toml victory.toml
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-Before the first run, ahead of time (both can be stopped and go on later):
+In `victory.toml`, set `game_dir` to the directory containing your title
+files. Set `$TitleExecutable` to the full path of the title executable
+before running:
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+.\scripts\play.ps1 -Exe $TitleExecutable -More @{
+    VICTORY_AMBIENT_REFLECT = '1'
+    VICTORY_CARD_BUFFERS_MIN_KB = '1024'
+    VICTORY_DISPLAY_MODE = '1920x1080'
+    VICTORY_MEMORY_MAP = '0'
+    VICTORY_RDNA_FLOAT = '0'
+    VICTORY_SLOT_COUNTS = '1'
+    VICTORY_TEXTURE_ROOM_PERCENT = '78'
+    VICTORY_WINDOW_MAX = '1280x720'
+}
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+`VICTORY_DISPLAY_MODE` controls the reported display mode. The game still
+drew world frames at 2560×1440 in the tested configuration. After a run,
+`.\target\diag\victory.exe warm --used` prebuilds pipelines observed in that
+cache. Streaming and frame-pacing stalls can still occur.
 
-## What is different here
+## Contribute
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+Target `windows-rdna4` for pull requests about this build. Include the
+hardware, driver, settings, test scene, and frame times in performance
+reports. [Test commands and credits](CONTRIBUTING.md)
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
-
-## Credits
-
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
-
-## License
-
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
-
-ZETTROX
+The source is GPL-3.0-or-later. Title files, saves, and generated shader
+caches belong outside the checkout. [License](LICENSE) · [Asset policy](docs/asset-policy.md)
