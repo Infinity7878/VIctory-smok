@@ -16,8 +16,8 @@ cache. Results are from the prologue and prison.
 | Progression | Reached the guard escort through the prison hallway. Later missions are unverified. |
 | Frame rate | Usually 18–20 FPS during the tested prison sequences, with short stretches at 23–26 FPS. The intro still has stalls. |
 | Characters | Lip, jaw, and blink animation observed. The tester confirmed corrected eye shading. |
-| Ground and geometry | The tester confirmed visible ground textures. Intermittent stretched polygons remain open. |
-| Phone displays | Blank screens remain open. The experimental texture refresh ran on intro video textures. |
+| Ground and geometry | Ground textures are intermittent. The tester saw the prison floor turn black again after textures had appeared. Stretched polygons remain open. |
+| Phone displays | The diner phone display was blank in Series X and Series S tests. The experimental refresh ran on video textures, and the phone display still needs a fix. |
 | 60 FPS | Still a target. The tested title requested a 33.3 ms frame interval. |
 
 ## Build and run
@@ -56,7 +56,9 @@ before running:
 `VICTORY_DISPLAY_MODE` controls the reported display mode. The game still
 drew world frames at 2560×1440 in the tested configuration. After a run,
 `.\target\diag\victory.exe warm --used` prebuilds pipelines observed in that
-cache. Streaming and frame-pacing stalls can still occur.
+cache. Streaming and frame-pacing stalls can still occur. In a Series S test,
+the picture was briefly black before the intro rendered. Series X is the
+reproduced configuration for the run instructions above.
 
 ## Contribute
 
